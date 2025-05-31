@@ -1,0 +1,426 @@
+import pygame
+import vgamepad as vg
+import keyboard  # Hoặc dùng pygame để bắt sự kiện nút trigger từ gamepad
+import time
+import math
+
+# --- Cấu hình ---
+PHYSICAL_GAMEPAD_INDEX = 0  # ID của tay cầm thật (thường là 0)
+VIRTUAL_GAMEPAD_TYPE = 'XBOX' # Chọn 'XBOX' (VX360Gamepad) hoặc 'DS4' (VDS4Gamepad)
+EXIT_KEY = 'esc'            # Phím để thoát chương trình
+AXIS_DEADZONE = 0.15        # Ngưỡng joystick không nhận diện chuyển động nhỏ
+LOOP_DELAY = 0.01           # Độ trễ vòng lặp (giây), ~100Hz
+L2_TRIGGER_THRESHOLD = 0.8  # Ngưỡng kích hoạt macro khi nhấn L2 (0.0 đến 1.0)
+RS_BUTTON_ID = 8            # ID của nút Right Stick press (RS)
+
+# --- Trạng thái toàn cục ---
+physical_state = {
+    'buttons': set(), # Lưu các nút đang được nhấn trên tay thật
+    'axes': {},       # Lưu giá trị các trục analog
+    'hats': {}        # Lưu trạng thái D-Pad/Hat
+}
+virtual_gamepad = None
+is_macro_running = False
+macro_start_time = 0  # Thời điểm bắt đầu chạy macro
+last_l2_state = False  # Lưu trạng thái L2 lần trước
+
+# --- Ánh xạ Nút (Ví dụ cho Pygame -> VGamepad Xbox) ---
+# Cần điều chỉnh dựa trên tay cầm và VIRTUAL_GAMEPAD_TYPE của bạn
+# Lấy ID nút từ các tool test gamepad hoặc thử nghiệm
+PYGAME_TO_VG_XBOX_MAP = {
+    0: vg.XUSB_BUTTON.XUSB_GAMEPAD_A,           # Button 0: A (nút xanh lá)
+    1: vg.XUSB_BUTTON.XUSB_GAMEPAD_B,           # Button 1: B (nút đỏ)
+    2: vg.XUSB_BUTTON.XUSB_GAMEPAD_X,           # Button 2: X (nút xanh dương)
+    3: vg.XUSB_BUTTON.XUSB_GAMEPAD_Y,           # Button 3: Y (nút vàng)
+    4: vg.XUSB_BUTTON.XUSB_GAMEPAD_BACK,        # Button 4: Back button
+    6: vg.XUSB_BUTTON.XUSB_GAMEPAD_START,       # Button 6: Start button (pause)
+    8: vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_THUMB, # Button 7: Right Stick press (RS)
+    7: vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_THUMB,  # Button 8: Left Stick press (LS)
+    9: vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER,  # Button 9: L1
+    10: vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER, # Button 10: R1
+    11: vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_UP,    # Button 11: D-pad Up
+    12: vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN,  # Button 12: D-pad Down
+    13: vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT,  # Button 13: D-pad Left
+    14: vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT, # Button 14: D-pad Right
+    # DPAD được xử lý riêng qua hat
+}
+
+# --- Ánh xạ Nút (Ví dụ cho Pygame -> VGamepad DS4) ---
+# CẦN ĐIỀU CHỈNH dựa trên tay cầm và cách Pygame nhận diện nút của bạn!
+# Lấy ID nút (0, 1, 2, ...) từ các tool test gamepad hoặc code thử nghiệm in ra event.button
+# PYGAME_TO_VG_DS4_MAP = {
+#     # Cần điều chỉnh dựa trên tay cầm và cách Pygame nhận diện nút cho DS4
+#     0: vg.DS4_BUTTONS.DS4_BUTTON_CROSS,    # X button (nút xanh dương)
+#     1: vg.DS4_BUTTONS.DS4_BUTTON_CIRCLE,   # O button (nút đỏ)
+#     2: vg.DS4_BUTTONS.DS4_BUTTON_SQUARE,   # □ button (nút hồng)
+#     3: vg.DS4_BUTTONS.DS4_BUTTON_TRIANGLE, # △ button (nút xanh lá)
+#     4: vg.DS4_BUTTONS.DS4_BUTTON_SHARE,    # Share button
+#     6: vg.DS4_BUTTONS.DS4_BUTTON_OPTIONS,  # Options button
+#     7: vg.DS4_BUTTONS.DS4_BUTTON_THUMB_LEFT,  # L3 button
+#     8: vg.DS4_BUTTONS.DS4_BUTTON_THUMB_RIGHT, # R3 button
+#     9: vg.DS4_BUTTONS.DS4_BUTTON_SHOULDER_LEFT,  # L1
+#     10: vg.DS4_BUTTONS.DS4_BUTTON_SHOULDER_RIGHT, # R1
+#     # DPAD được xử lý riêng qua hat
+# }
+
+def get_angle_from_xy(x, y):
+    """Tính góc (độ) từ giá trị x, y của joystick. 0 độ là hướng phải, 90 là lên, 180 là trái, 270/-90 là xuống."""
+    angle = math.degrees(math.atan2(y, x))
+    if angle < 0:
+        angle += 360
+    return angle
+
+# --- Cấu hình Macro ---
+# Thời gian chờ cho macro (giây)
+MACRO_DELAY_1 = 0.100  # Thời gian chờ giữa bước 1 và 2 (100 ms)
+MACRO_DELAY_2 = 0.100  # Thời gian chờ giữa bước 2 và 3 (150 ms)
+
+# Góc di chuyển (độ) cho Macro L2
+MACRO_ANGLE_OFFSET_LEFT = 5   # goctrai = gocxuly + 20
+MACRO_ANGLE_OFFSET_RIGHT = 50  # gocphai = gocxuly + 70
+
+# Góc di chuyển (độ) cho Macro RS click
+# Sử dụng góc âm để quay theo chiều kim đồng hồ (bên phải)
+MACRO_RS_ANGLE_OFFSET_LEFT = -5  # goctrai = gocxuly - 30
+MACRO_RS_ANGLE_OFFSET_RIGHT = -50 # gocphai = gocxuly - 80
+
+# Ngưỡng coi như cần analog ở trung tâm
+ANALOG_CENTER_THRESHOLD = 0.05
+
+# --- Định nghĩa Macro ---
+def perform_complex_joystick_macro():
+    global virtual_gamepad, is_macro_running
+
+    # Giá trị hằng số
+    JOYSTICK_CENTER = 0.0
+    INTENSITY = 1.0  # Kéo cần đến vị trí tối đa
+
+    # Lấy vị trí hiện tại của joystick trái
+    ls_x = physical_state['axes'].get(0, 0.0)
+    ls_y = -physical_state['axes'].get(1, 0.0)
+    
+    # Kiểm tra nếu cần ở trung tâm
+    if abs(ls_x) < ANALOG_CENTER_THRESHOLD and abs(ls_y) < ANALOG_CENTER_THRESHOLD:
+        print("Joystick trái đang ở trung tâm. Sử dụng góc mặc định.")
+        joystickleft_angle = 90  # Góc mặc định, hướng lên
+    else:
+        joystickleft_angle = get_angle_from_xy(ls_x, ls_y)
+    
+    print(f"Góc joystick trái hiện tại: {joystickleft_angle:.2f} độ")
+
+    # Tính góc trái/phải dựa trên góc hiện tại (tương tự như trong import pygame.py)
+    goc_phai = (joystickleft_angle + MACRO_ANGLE_OFFSET_RIGHT) % 360
+    goc_trai = (joystickleft_angle + MACRO_ANGLE_OFFSET_LEFT) % 360
+
+    print(f"Macro: Bắt đầu thực hiện chuỗi thao tác.")
+    virtual_gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
+    virtual_gamepad.update()
+    time.sleep(MACRO_DELAY_1)
+    virtual_gamepad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
+    virtual_gamepad.update()
+    # Bước 1: Kéo cần phải đến góc goc_phai
+    print(f"Macro Step 1: Right Stick, góc {goc_phai:.2f}")
+    angle_rad = math.radians(goc_phai)
+    x_val = INTENSITY * math.cos(angle_rad)
+    y_val = INTENSITY * math.sin(angle_rad)
+    virtual_gamepad.right_joystick_float(x_val, y_val)
+    virtual_gamepad.update()
+    
+    # Bước 2: Chờ MACRO_DELAY_1
+    print(f"Macro Step 2: Chờ {MACRO_DELAY_1*1000:.0f}ms")
+    time.sleep(MACRO_DELAY_1)
+    
+    # Bước 3: Kéo cần trái đến góc goc_trai
+    print(f"Macro Step 3: Left Stick, góc {goc_trai:.2f}")
+    angle_rad = math.radians(goc_trai)
+    x_val = INTENSITY * math.cos(angle_rad)
+    y_val = INTENSITY * math.sin(angle_rad)
+    virtual_gamepad.left_joystick_float(x_val, y_val)
+    virtual_gamepad.update()
+    
+    # Bước 4: Chờ MACRO_DELAY_2
+    print(f"Macro Step 4: Chờ {MACRO_DELAY_2*1000:.0f}ms")
+    time.sleep(MACRO_DELAY_2)
+    
+    # Bước 5: Nhả cả hai cần về trung tâm
+    print("Macro Step 5: Nhả cả hai cần về trung tâm")
+    virtual_gamepad.left_joystick_float(JOYSTICK_CENTER, JOYSTICK_CENTER)
+    virtual_gamepad.right_joystick_float(JOYSTICK_CENTER, JOYSTICK_CENTER)
+    virtual_gamepad.update()
+    
+    # Kết thúc macro
+    print("--- Macro Finished ---")
+    is_macro_running = False
+
+# --- Định nghĩa Macro cho Right Stick Click ---
+def perform_rs_click_macro():
+    global virtual_gamepad, is_macro_running
+
+    # Giá trị hằng số
+    JOYSTICK_CENTER = 0.0
+    INTENSITY = 1.0  # Kéo cần đến vị trí tối đa
+
+    # Lấy vị trí hiện tại của joystick trái
+    ls_x = physical_state['axes'].get(0, 0.0)
+    ls_y = -physical_state['axes'].get(1, 0.0)
+    
+    # Kiểm tra nếu cần ở trung tâm
+    if abs(ls_x) < ANALOG_CENTER_THRESHOLD and abs(ls_y) < ANALOG_CENTER_THRESHOLD:
+        print("Joystick trái đang ở trung tâm. Sử dụng góc mặc định.")
+        joystickleft_angle = 90  # Góc mặc định, hướng lên
+    else:
+        joystickleft_angle = get_angle_from_xy(ls_x, ls_y)
+    
+    print(f"Góc joystick trái hiện tại: {joystickleft_angle:.2f} độ")
+
+    # Tính góc trái/phải dựa trên góc hiện tại, sử dụng OFFSET riêng cho RS Click
+    goc_phai = (joystickleft_angle + MACRO_RS_ANGLE_OFFSET_RIGHT) % 360
+    goc_trai = (joystickleft_angle + MACRO_RS_ANGLE_OFFSET_LEFT) % 360
+
+    print(f"Macro RS: Bắt đầu thực hiện chuỗi thao tác.")
+    virtual_gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
+    virtual_gamepad.update()
+    time.sleep(MACRO_DELAY_1)
+    virtual_gamepad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
+    virtual_gamepad.update()
+    # Bước 1: Kéo cần phải đến góc goc_phai
+    print(f"Macro RS Step 1: Right Stick, góc {goc_phai:.2f}")
+    angle_rad = math.radians(goc_phai)
+    x_val = INTENSITY * math.cos(angle_rad)
+    y_val = INTENSITY * math.sin(angle_rad)
+    virtual_gamepad.right_joystick_float(x_val, y_val)
+    virtual_gamepad.update()
+    
+    # Bước 2: Chờ MACRO_DELAY_1
+    print(f"Macro RS Step 2: Chờ {MACRO_DELAY_1*1000:.0f}ms")
+    time.sleep(MACRO_DELAY_1)
+    
+    # Bước 3: Kéo cần trái đến góc goc_trai
+    print(f"Macro RS Step 3: Left Stick, góc {goc_trai:.2f}")
+    angle_rad = math.radians(goc_trai)
+    x_val = INTENSITY * math.cos(angle_rad)
+    y_val = INTENSITY * math.sin(angle_rad)
+    virtual_gamepad.left_joystick_float(x_val, y_val)
+    virtual_gamepad.update()
+    
+    # Bước 4: Chờ MACRO_DELAY_2
+    print(f"Macro RS Step 4: Chờ {MACRO_DELAY_2*1000:.0f}ms")
+    time.sleep(MACRO_DELAY_2)
+    
+    # Bước 5: Nhả cả hai cần về trung tâm
+    print("Macro RS Step 5: Nhả cả hai cần về trung tâm")
+    virtual_gamepad.left_joystick_float(JOYSTICK_CENTER, JOYSTICK_CENTER)
+    virtual_gamepad.right_joystick_float(JOYSTICK_CENTER, JOYSTICK_CENTER)
+    virtual_gamepad.update()
+    
+    # Kết thúc macro
+    print("--- Macro RS Finished ---")
+    is_macro_running = False
+
+def check_l2_trigger():
+    """Kiểm tra nếu L2 được nhấn đủ mạnh để kích hoạt macro"""
+    global last_l2_state
+    
+    # Lấy giá trị L2 từ trục analog (thường là axis 4)
+    l2_value = physical_state['axes'].get(4, -1.0)  # -1.0 là không nhấn
+    l2_float = (l2_value + 1.0) / 2.0  # Chuyển từ [-1,1] sang [0,1]
+    
+    # Kiểm tra nếu L2 được nhấn mạnh hơn ngưỡng
+    current_l2_state = l2_float > L2_TRIGGER_THRESHOLD
+    
+    # Chỉ kích hoạt khi L2 chuyển từ không nhấn sang nhấn
+    if current_l2_state and not last_l2_state and not is_macro_running:
+        trigger_macro()
+    
+    last_l2_state = current_l2_state
+
+# --- Hàm kích hoạt Macro ---
+def trigger_macro():
+    global is_macro_running
+    if not is_macro_running:
+        print(f"\n--- Macro Triggered ---")
+        is_macro_running = True
+        
+        # Reset trạng thái ảo về mặc định trước khi chạy macro (quan trọng)
+        virtual_gamepad.reset()
+        virtual_gamepad.update() # Gửi trạng thái reset
+        time.sleep(0.02) # Chờ chút để đảm bảo reset được xử lý
+        
+        # Thực hiện macro ngay lập tức
+        perform_complex_joystick_macro()
+
+# --- Hàm chính ---
+def main():
+    global virtual_gamepad, physical_state, is_macro_running
+
+    # 1. Khởi tạo Pygame
+    pygame.init()
+    pygame.joystick.init()
+    print(f"Tìm thấy {pygame.joystick.get_count()} tay cầm.")
+    if pygame.joystick.get_count() <= PHYSICAL_GAMEPAD_INDEX:
+        print(f"Lỗi: Không tìm thấy tay cầm vật lý tại index {PHYSICAL_GAMEPAD_INDEX}.")
+        return
+    physical_gamepad = pygame.joystick.Joystick(PHYSICAL_GAMEPAD_INDEX)
+    physical_gamepad.init()
+    print(f"Đã kết nối tay cầm vật lý: {physical_gamepad.get_name()}")
+    num_axes = physical_gamepad.get_numaxes()
+    num_buttons = physical_gamepad.get_numbuttons()
+    num_hats = physical_gamepad.get_numhats()
+    print(f"Thông số: Axes={num_axes}, Buttons={num_buttons}, Hats={num_hats}")
+
+    # Khởi tạo trạng thái ban đầu cho axes và hats
+    for i in range(num_axes): physical_state['axes'][i] = 0.0
+    for i in range(num_hats): physical_state['hats'][i] = (0, 0)
+
+
+    # 2. Khởi tạo Gamepad ảo
+    try:
+        if VIRTUAL_GAMEPAD_TYPE == 'DS4':
+             virtual_gamepad = vg.VDS4Gamepad()
+             button_map = PYGAME_TO_VG_DS4_MAP
+             print("Đã tạo tay cầm ảo VDS4Gamepad (Wireless Controller).")
+        else: # Mặc định là Xbox
+             virtual_gamepad = vg.VX360Gamepad()
+             button_map = PYGAME_TO_VG_XBOX_MAP
+             print("Đã tạo tay cầm ảo VX360Gamepad (Xbox 360 Controller).")
+    except Exception as e:
+        print(f"Lỗi tạo tay cầm ảo: {e}")
+        print("Hãy đảm bảo ViGEmBus driver đã được cài đặt.")
+        return
+
+    print(f"Nhấn '{EXIT_KEY}' để thoát chương trình.")
+    print(f"Nhấn L2 để kích hoạt macro (ngưỡng: {L2_TRIGGER_THRESHOLD})")
+    print("--- Bắt đầu vòng lặp chính ---")
+
+    # 4. Vòng lặp chính
+    running = True
+    while running:
+        start_time = time.perf_counter()        # --- Xử lý sự kiện Pygame ---
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+                break
+            # Cập nhật trạng thái vật lý
+            if event.type == pygame.JOYBUTTONDOWN:
+                physical_state['buttons'].add(event.button)
+                # Xử lý RS click - kích hoạt macro 2
+                if event.button == RS_BUTTON_ID and not is_macro_running:
+                    print(f"\n--- RS Click Detected - Macro Triggered ---")
+                    is_macro_running = True
+                    # Reset trạng thái ảo về mặc định trước khi chạy macro
+                    virtual_gamepad.reset()
+                    virtual_gamepad.update()
+                    time.sleep(0.02)
+                    # Thực hiện macro RS click
+                    perform_rs_click_macro()
+            elif event.type == pygame.JOYBUTTONUP:
+                physical_state['buttons'].discard(event.button)
+            elif event.type == pygame.JOYAXISMOTION:
+                # Áp dụng deadzone
+                value = event.value
+                if abs(value) < AXIS_DEADZONE:
+                    value = 0.0
+                physical_state['axes'][event.axis] = value
+            elif event.type == pygame.JOYHATMOTION:
+                physical_state['hats'][event.hat] = event.value
+
+        if not running: break
+
+        # --- Kiểm tra phím thoát ---
+        if keyboard.is_pressed(EXIT_KEY):
+            running = False
+            break
+
+        # --- Kiểm tra L2 trigger ---
+        check_l2_trigger()        # --- Logic Macro / Passthrough ---
+        if is_macro_running:
+            # Macro được thực hiện trong hàm perform_complex_joystick_macro
+            # không cần gọi lại ở đây vì đã được gọi từ trigger_macro()
+            pass
+        else:
+            # --- Chế độ Passthrough ---
+            # Sao chép trạng thái từ vật lý sang ảo
+            vg_buttons_pressed = set()
+            for btn_id in physical_state['buttons']:
+                if btn_id in button_map:
+                    vg_buttons_pressed.add(button_map[btn_id])
+
+            # So sánh với trạng thái ảo trước đó để nhấn/thả
+            all_vg_buttons = set(button_map.values())
+            for vg_btn in all_vg_buttons:
+                is_physically_pressed = vg_btn in vg_buttons_pressed
+                if is_physically_pressed:
+                    virtual_gamepad.press_button(button=vg_btn)
+                else:
+                    virtual_gamepad.release_button(button=vg_btn)
+
+            # Trục Analog
+            ls_x = physical_state['axes'].get(0, 0.0)
+            ls_y = -physical_state['axes'].get(1, 0.0)
+            rs_x = physical_state['axes'].get(2, 0.0)
+            rs_y = -physical_state['axes'].get(3, 0.0)
+
+            # Trigger
+            lt_axis_val = physical_state['axes'].get(4, -1.0)
+            rt_axis_val = physical_state['axes'].get(5, -1.0)
+            lt_float = (lt_axis_val + 1.0) / 2.0
+            rt_float = (rt_axis_val + 1.0) / 2.0
+
+            virtual_gamepad.left_joystick_float(x_value_float=ls_x, y_value_float=ls_y)
+            virtual_gamepad.right_joystick_float(x_value_float=rs_x, y_value_float=rs_y)
+            virtual_gamepad.left_trigger_float(value_float=lt_float)
+            virtual_gamepad.right_trigger_float(value_float=rt_float)
+
+            # D-Pad / Hat
+            if num_hats > 0:
+                hat_x, hat_y = physical_state['hats'].get(0, (0, 0))
+                # Reset DPAD trước khi set hướng mới
+                virtual_gamepad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_UP)
+                virtual_gamepad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN)
+                virtual_gamepad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT)
+                virtual_gamepad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT)
+
+                if hat_y > 0:
+                    virtual_gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_UP)
+                elif hat_y < 0:
+                    virtual_gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN)
+                if hat_x < 0:
+                    virtual_gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT)
+                elif hat_x > 0:
+                    virtual_gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT)
+
+        # --- Cập nhật trạng thái tay cầm ảo ---
+        try:
+            virtual_gamepad.update()
+        except Exception as update_err:
+            print(f"Lỗi khi cập nhật virtual gamepad: {update_err}")
+
+        # --- Delay ---
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+        sleep_time = max(0, LOOP_DELAY - elapsed_time)
+        time.sleep(sleep_time)
+
+    # --- Dọn dẹp ---
+    print("Đang thoát chương trình...")
+    try:
+        keyboard.unhook_all() # Gỡ bỏ hotkey
+    except Exception as e:
+        print(f"Lỗi khi gỡ bỏ hotkey: {e}")
+
+    if virtual_gamepad:
+        try:
+            virtual_gamepad.reset() # Đặt lại trạng thái ảo về 0
+            virtual_gamepad.update()
+            print("Đã reset tay cầm ảo.")
+        except Exception as e:
+            print(f"Lỗi khi reset tay cầm ảo lúc thoát: {e}")
+
+    pygame.quit()
+    print("Đã đóng Pygame. Thoát.")
+
+# --- Chạy chương trình ---
+if __name__ == "__main__":
+    # Lời khuyên: Chạy trong terminal để xem output và lỗi
+    # Nếu dùng IDE, đảm bảo terminal/console của IDE hiển thị output
+    main()
